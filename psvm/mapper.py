@@ -1,46 +1,72 @@
-#!/usr/bin/env python
-# encoding: utf-8
-
 import base64
 import cPickle as pickle
-import logging
-import numpy
+from mrjob.job import MRJob
+import numpy as np
 
-#import mrtools
+def numerify_feature(feature):
+    if feature == '?':
+        feature = 0.0
+    return float(feature)
 
-from itertools import groupby
-from operator import itemgetter
-import sys
+def extract_features(array):
+    features = array[1:-1]
+    return [numerify_feature(f) for f in features]
 
-def read_input(file, separator="\t"):
-    for line in file:
-        yield line.rstrip().split(separator)
+def extract_category(array, neg_category, pos_category):
+    category = array[-1].strip()
+    return -1.0 if category == neg_category else 1.0
 
-def run_mapper(map, separator="\t"):
-    data = read_input(sys.stdin,separator)
-    for (key,value) in data:
-        map(key,value)
+class MRsvm(MRJob):
+    def __init__(self, *args, **kwargs):
+        super(MRsvm, self).__init__(*args, **kwargs)
 
-def map(key, value):
-    trainingclasses = [float(i) for i in key.split(",")]
-    trainingfeatures = [float(i) for i in value.split(",")]
+    def transform_input(self, _, value):
+        array = value.split(',')
+        features = extract_features(array)
+        category = extract_category(array, neg_category = '4', pos_category = '2')
+        yield(category, features)
 
-    # if more than one class in classes, the features contains
-    # |classes| consecutive training example feature vectors
-    # so need to reshape it, to have 1 per row
-    numtrainingclasses = len(trainingclasses)
-    numtrainingfeatures = len(trainingfeatures)
-    numfeaturesperexample = numtrainingfeatures/numtrainingclasses
+    def mapper(self, key, value):
+        num_training_features = len(value)
 
-    A = numpy.matrix(
-        numpy.reshape(numpy.array(trainingfeatures), 
-                      (numtrainingclasses,numfeaturesperexample)))
-    D = numpy.diag(trainingclasses)
-    e = numpy.matrix(numpy.ones(len(A)).reshape(len(A),1))
-    E = numpy.matrix(numpy.append(A,-e,axis=1))
+        A = np.matrix(
+            np.reshape(np.array(value),
+                       (1, num_training_features)))
+        D = np.diag([key])
+        e = np.matrix(np.ones(len(A)).reshape(len(A), 1))
+        E = np.matrix(np.append(A, -e, axis = 1))
 
-    value = base64.b64encode(pickle.dumps((E.T*E, E.T*D*e)))
-    print "outputkey\t%s" % ( value )
+        value = base64.b64encode(pickle.dumps((E.T*E, E.T*D*e)))
+        yield("outputkey", value)
 
-if __name__ == "__main__":
-    run_mapper(map)
+    def reducer(self, key, values):
+        mu = 0.1
+
+        sum_ETE = None
+        sum_ETDe = None
+
+        for value in values:
+            ETE, ETDe = pickle.loads(base64.b64decode(value))
+
+            if sum_ETE == None:
+                sum_ETE = np.matrix(np.eye(ETE.shape[1])/mu)
+            sum_ETE += ETE
+            
+            if sum_ETDe == None:
+                sum_ETDe = ETDe
+            else:
+                sum_ETDe += ETDe
+
+
+        result = sum_ETE.I * sum_ETDe
+        yield(key, str(result.tolist()))
+
+    def steps(self):
+        return [self.mr(mapper = self.transform_input),
+                self.mr(mapper = self.mapper,
+                        reducer = self.reducer)]
+
+
+if __name__ == '__main__':
+    MRsvm.run()
+
